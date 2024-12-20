@@ -103,7 +103,7 @@ fn delete_items_from_vec<T>(mut to_delete: Vec<usize>, vec: &mut Vec<T>) {
 
 struct ColorRangeAdjustment {
     should_delete: bool,
-    to_insert: Option<ColorTag>,
+    to_insert: Option<FormatTag>,
 }
 
 fn range_fully_conatins(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -119,7 +119,7 @@ fn range_ends_overlapping(a: &Range<usize>, b: &Range<usize>) -> bool {
 }
 
 fn adjust_existing_color_range(
-    existing_elem: &mut ColorTag,
+    existing_elem: &mut FormatTag,
     range: &Range<usize>,
 ) -> ColorRangeAdjustment {
     let mut ret = ColorRangeAdjustment {
@@ -136,10 +136,11 @@ fn adjust_existing_color_range(
         }
 
         if range.end != existing_elem.end {
-            ret.to_insert = Some(ColorTag {
+            ret.to_insert = Some(FormatTag {
                 start: range.end,
                 end: existing_elem.end,
                 color: existing_elem.color,
+                bold: existing_elem.bold
             });
         }
 
@@ -164,7 +165,7 @@ fn adjust_existing_color_range(
     ret
 }
 
-fn adjust_existing_color_ranges(existing: &mut Vec<ColorTag>, range: &Range<usize>) {
+fn adjust_existing_color_ranges(existing: &mut Vec<FormatTag>, range: &Range<usize>) {
     let mut effected_infos = existing
         .iter_mut()
         .enumerate()
@@ -191,6 +192,7 @@ fn adjust_existing_color_ranges(existing: &mut Vec<ColorTag>, range: &Range<usiz
 pub struct CursorState {
     pub x: usize,
     pub y: usize,
+    bold: bool,
     color: TerminalColor,
 }
 
@@ -210,7 +212,6 @@ pub enum TerminalColor {
 impl TerminalColor {
     fn from_sgr(sgr: SelectGraphicRendition) -> Option<TerminalColor> {
         let ret = match sgr {
-            SelectGraphicRendition::Reset => TerminalColor::Default,
             SelectGraphicRendition::Black => TerminalColor::Black,
             SelectGraphicRendition::Red => TerminalColor::Red,
             SelectGraphicRendition::Green => TerminalColor::Green,
@@ -238,35 +239,38 @@ fn ranges_overlap(a: Range<usize>, b: Range<usize>) -> bool {
     true
 }
 
-#[derive(Debug)]
-struct ColorTag {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormatTag {
     pub start: usize,
     pub end: usize,
     pub color: TerminalColor,
+    pub bold: bool,
 }
 
-struct ColorTracker {
-    color_info: Vec<ColorTag>,
+struct FormatTracker {
+    color_info: Vec<FormatTag>,
 }
 
-impl ColorTracker {
-    fn new() -> ColorTracker {
-        ColorTracker {
-            color_info: vec![ColorTag {
+impl FormatTracker {
+    fn new() -> FormatTracker {
+        FormatTracker {
+            color_info: vec![FormatTag {
                 start: 0,
                 end: usize::MAX,
                 color: TerminalColor::Default,
+                bold: false,
             }],
         }
     }
 
-    fn push_range(&mut self, cursor_color: TerminalColor, range: Range<usize>) {
+    fn push_range(&mut self, cursor: &CursorState, range: Range<usize>) {
         adjust_existing_color_ranges(&mut self.color_info, &range);
 
-        self.color_info.push(ColorTag {
+        self.color_info.push(FormatTag {
             start: range.start,
             end: range.end,
-            color: cursor_color,
+            color: cursor.color,
+            bold: cursor.bold,
         });
 
         // FIXME: Insertion sort
@@ -274,26 +278,15 @@ impl ColorTracker {
         self.color_info.sort_by(|a, b| a.start.cmp(&b.start));
     }
 
-    fn colors(&self) -> Vec<(Range<usize>, TerminalColor)> {
-        let mut output = Vec::new();
-        for i in 0..self.color_info.len() {
-            // FIXME: Track actual buffer len maybe?
-            let end = self
-                .color_info
-                .get(i + 1)
-                .map(|x| x.start)
-                .unwrap_or(usize::MAX);
-            let item = &self.color_info[i];
-            output.push((item.start..end, item.color))
-        }
-        output
+    fn tags(&self) -> Vec<FormatTag> {
+        self.color_info.clone()
     }
 }
 
 pub struct TerminalEmulator {
     output_buf: AnsiParser,
     buf: Vec<u8>,
-    color_tracker: ColorTracker,
+    format_tracker: FormatTracker,
     cursor_pos: CursorState,
     fd: OwnedFd,
 }
@@ -306,10 +299,11 @@ impl TerminalEmulator {
         TerminalEmulator {
             output_buf: AnsiParser::new(),
             buf: Vec::new(),
-            color_tracker: ColorTracker::new(),
+            format_tracker: FormatTracker::new(),
             cursor_pos: CursorState {
                 x: 0,
                 y: 0,
+                bold: false,
                 color: TerminalColor::Default,
             },
             fd,
@@ -339,8 +333,8 @@ impl TerminalEmulator {
                     TerminalOutput::Data(data) => {
                         let output_start = cursor_to_buffer_position(&self.cursor_pos, &self.buf);
                         insert_data_at_position(&data, output_start, &mut self.buf);
-                        self.color_tracker.push_range(
-                            self.cursor_pos.color,
+                        self.format_tracker.push_range(
+                            &self.cursor_pos,
                             output_start..output_start + data.len(),
                         );
                         update_cursor(&data, &mut self.cursor_pos);
@@ -355,8 +349,8 @@ impl TerminalEmulator {
                     }
                     TerminalOutput::ClearForwards => {
                         let buf_pos = cursor_to_buffer_position(&self.cursor_pos, &self.buf);
-                        self.color_tracker
-                            .push_range(self.cursor_pos.color, buf_pos..usize::MAX);
+                        self.format_tracker
+                            .push_range(&self.cursor_pos, buf_pos..usize::MAX);
                         self.buf = self.buf[..buf_pos].to_vec();
                     }
                     TerminalOutput::ClearBackwards => {
@@ -367,13 +361,19 @@ impl TerminalEmulator {
                         self.buf = self.buf[buf_pos..].to_vec();
                     }
                     TerminalOutput::ClearAll => {
-                        self.color_tracker
-                            .push_range(self.cursor_pos.color, 0..usize::MAX);
+                        self.format_tracker
+                            .push_range(&self.cursor_pos, 0..usize::MAX);
                         self.buf.clear();
                     }
                     TerminalOutput::Sgr(sgr) => {
+                        //TODO: should be match?
                         if let Some(color) = TerminalColor::from_sgr(sgr) {
                             self.cursor_pos.color = color;
+                        } else if sgr == SelectGraphicRendition::Reset {
+                            self.cursor_pos.color = TerminalColor::Default;
+                            self.cursor_pos.bold = false; 
+                        } else if sgr == SelectGraphicRendition::Bold {
+                            self.cursor_pos.bold = true;
                         } else {
                             println!("Unhandled sgr: {:?}", sgr);
                         }
@@ -394,8 +394,8 @@ impl TerminalEmulator {
         &self.buf
     }
 
-    pub fn colored_data(&self) -> Vec<(Range<usize>, TerminalColor)> {
-        self.color_tracker.colors()
+    pub fn format_data(&self) -> Vec<FormatTag> {
+        self.format_tracker.tags()
     }
 
     pub fn cursor_pos(&self) -> CursorState {
@@ -425,56 +425,66 @@ mod test {
 
     #[test]
     fn basic_color_tracker_test() {
-        let mut color_tracker = ColorTracker::new();
+        let mut format_tracker = FormatTracker::new();
+        let mut cursor_state = CursorState {
+            x:0,
+            y:0,
+            color: TerminalColor::Default,
+            bold: false
+        };
 
-        color_tracker.push_range(TerminalColor::Yellow, 3..10);
-        let colors = color_tracker.colors();
+        cursor_state.color = TerminalColor::Yellow;
+        format_tracker.push_range(&cursor_state, 3..10);
+        let tags = format_tracker.tags();
         assert_eq!(
-            colors,
+            tags,
             &[
-                (0..3, TerminalColor::Default),
-                (3..10, TerminalColor::Yellow),
-                (10..usize::MAX, TerminalColor::Default),
+                FormatTag { start:0, end:3, color: TerminalColor::Default, bold: false },
+                FormatTag { start:3, end:10, color: TerminalColor::Yellow, bold: false },
+                FormatTag { start:10, end:usize::MAX, color: TerminalColor::Default, bold: false },
             ]
         );
 
-        color_tracker.push_range(TerminalColor::Blue, 5..7);
-        let colors = color_tracker.colors();
+        cursor_state.color = TerminalColor::Blue;
+        format_tracker.push_range(&cursor_state, 5..7);
+        let tags = format_tracker.tags();
         assert_eq!(
-            colors,
+            tags,
             &[
-                (0..3, TerminalColor::Default),
-                (3..5, TerminalColor::Yellow),
-                (5..7, TerminalColor::Blue),
-                (7..10, TerminalColor::Yellow),
-                (10..usize::MAX, TerminalColor::Default),
+                FormatTag { start:0, end:3, color: TerminalColor::Default, bold: false },
+                FormatTag { start:3, end:5, color: TerminalColor::Yellow, bold: false },
+                FormatTag { start:5, end:7, color: TerminalColor::Blue, bold: false },
+                FormatTag { start:7, end:10, color: TerminalColor::Yellow, bold: false },
+                FormatTag { start:10, end:usize::MAX, color: TerminalColor::Default, bold: false },
             ]
         );
 
-        color_tracker.push_range(TerminalColor::Green, 7..9);
-        let colors = color_tracker.colors();
+        cursor_state.color = TerminalColor::Green;
+        format_tracker.push_range(&cursor_state, 7..9);
+        let tags = format_tracker.tags();
         assert_eq!(
-            colors,
+            tags,
             &[
-                (0..3, TerminalColor::Default),
-                (3..5, TerminalColor::Yellow),
-                (5..7, TerminalColor::Blue),
-                (7..9, TerminalColor::Green),
-                (9..10, TerminalColor::Yellow),
-                (10..usize::MAX, TerminalColor::Default),
+                FormatTag { start:0, end:3, color: TerminalColor::Default, bold: false },
+                FormatTag { start:3, end:5, color: TerminalColor::Yellow, bold: false },
+                FormatTag { start:5, end:7, color: TerminalColor::Blue, bold: false },
+                FormatTag { start:7, end:9, color: TerminalColor::Green, bold: false },
+                FormatTag { start:9, end:10, color: TerminalColor::Yellow, bold: false },
+                FormatTag { start:10, end:usize::MAX, color: TerminalColor::Default, bold: false },
             ]
         );
 
-        color_tracker.push_range(TerminalColor::Red, 6..11);
-        let colors = color_tracker.colors();
+        cursor_state.color = TerminalColor::Red;
+        format_tracker.push_range(&cursor_state, 6..11);
+        let tags = format_tracker.tags();
         assert_eq!(
-            colors,
+            tags,
             &[
-                (0..3, TerminalColor::Default),
-                (3..5, TerminalColor::Yellow),
-                (5..6, TerminalColor::Blue),
-                (6..11, TerminalColor::Red),
-                (11..usize::MAX, TerminalColor::Default),
+                FormatTag { start:0, end:3, color: TerminalColor::Default, bold: false },
+                FormatTag { start:3, end:5, color: TerminalColor::Yellow, bold: false },
+                FormatTag { start:5, end:6, color: TerminalColor::Blue, bold: false },
+                FormatTag { start:6, end:11, color: TerminalColor::Red, bold: false },
+                FormatTag { start:11, end:usize::MAX, color: TerminalColor::Default, bold: false },
             ]
         );
     }

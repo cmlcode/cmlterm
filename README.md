@@ -2,8 +2,8 @@
 * Create Window
 * Clear
 * Color control 
+* Bold
 
 ## Next Steps ##
-* Bold
 * Backspace
 * Debug rendering
