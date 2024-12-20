@@ -1,0 +1,9 @@
+[package]
+name = "cmlterm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.30.0"
+nix = { version = "0.27.1", defeault-features = false, features = ["term", "process", "fs"]}
+regex = "1.11.1"
